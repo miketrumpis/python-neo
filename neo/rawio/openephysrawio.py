@@ -120,8 +120,12 @@ class OpenEphysRawIO(BaseRawIO):
 
                 if seg_index == 0:
                     # add in channel list
+                    if ch_name[:2].upper() == 'CH':
+                        gain = chan_info['bitVolts'] * 1e-6
+                    else:
+                        gain = chan_info['bitVolts']
                     signal_channels.append((ch_name, chan_id, chan_info['sampleRate'],
-                                'int16', 'V', chan_info['bitVolts'], 0., processor_id))
+                                'int16', 'V', gain, 0., processor_id))
 
             # In some cases, continuous do not have the same lentgh because
             # one record block is missing when the "OE GUI is freezing"
