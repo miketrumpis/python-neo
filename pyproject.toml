@@ -23,6 +23,7 @@ classifiers = [
 
 dependencies = [
     "packaging",
+    "lxml",
     "numpy>=1.19.5",
     "quantities>=0.14.1",
 ]

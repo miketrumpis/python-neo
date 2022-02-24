@@ -12,6 +12,7 @@ import os
 import re
 
 import numpy as np
+from lxml import etree
 
 from .baserawio import (BaseRawIO, _signal_channel_dtype, _signal_stream_dtype,
                 _spike_channel_dtype, _event_channel_dtype)
@@ -78,6 +79,8 @@ class OpenEphysRawIO(BaseRawIO):
     def _parse_header(self):
         info = self._info = explore_folder(self.dirname)
         nb_segment = info['nb_segment']
+        channel_lookup = parse_channel_structure(self.dirname, nb_segment)
+        channel_lookup = normalize_channels(channel_lookup)
 
         # scan for continuous files
         self._sigs_memmap = {}
@@ -87,7 +90,7 @@ class OpenEphysRawIO(BaseRawIO):
         oe_indices = sorted(list(info['continuous'].keys()))
         for seg_index, oe_index in enumerate(oe_indices):
             self._sigs_memmap[seg_index] = {}
-
+            seg_lookup = channel_lookup[oe_index]
             all_sigs_length = []
             all_first_timestamps = []
             all_last_timestamps = []
@@ -97,8 +100,9 @@ class OpenEphysRawIO(BaseRawIO):
                 chan_info = read_file_header(fullname)
 
                 s = continuous_filename.replace('.continuous', '').split('_')
-                processor_id, ch_name = s[0], s[1]
-                chan_str = re.split(r'(\d+)', s[1])[0]
+                processor_id = s[0]
+                ch_name = seg_lookup[processor_id][continuous_filename]
+                chan_str = re.split(r'(\d+)', ch_name)[0]
                 # note that chan_id is not unique in case of CH + AUX
                 chan_id = int(ch_name.replace(chan_str, ''))
 
@@ -567,3 +571,102 @@ def read_file_header(filename):
                 header[key] = value.decode('ascii')
 
     return header
+
+
+def parse_channel_structure(dirname, segment):
+    """Look at the "Continuous_Data.openephys" file to create a lookup from
+    continuous file names to stream & id.
+
+    Returns a nested dictionary keyed by recording, then processor, then .continous file names
+
+    """
+
+    try:
+        if segment > 1:
+            xml_file = 'Continuous_Data_{:d}.openephys'.format(segment)
+        else:
+            xml_file = 'Continuous_Data.openephys'
+        elem_tree = etree.parse(os.path.join(dirname, xml_file))
+    except Exception as e:
+        # could catch exception, but let it raise for now to propagate
+        raise e
+    channel_lookup = dict()
+    rec_num = None
+    proc_id = None
+    real_proc_id = None
+    for e in elem_tree.iter():
+        if e.tag == 'EXPERIMENT':
+
+            # THIS IS BANANAS
+            # Section from "Continuous_Data.openephys" with files 100_1.continuous, ...:
+            # <EXPERIMENT version="0.5" number="1" separatefiles="0">
+            #   <RECORDING number="0" samplerate="30000.0">
+            #     <PROCESSOR id="102">
+            #       <CHANNEL name="A1_CH1" bitVolts="0.1949999928474426" filename="100_1.continuous"
+            #
+            # Section from "Continuous_Data_2.openephys" with files 100_1_2.continuous, ...:
+            # <EXPERIMENT version="0.5" number="2" separatefiles="0">
+            #   <RECORDING number="0" samplerate="30000.0">
+            #     <PROCESSOR id="102">
+            #       <CHANNEL name="A1_CH1" bitVolts="0.1949999928474426" filename="100_1_2.continuous"
+            #
+            # Have to conclude that the "_2" is related to the EXPERIMENT "number" attrib
+
+            rec_num = int(e.attrib['number']) - 1
+            channel_lookup.setdefault(rec_num, dict())
+        elif e.tag == 'PROCESSOR':
+            proc_id = e.attrib['id']
+            channel_lookup[rec_num].setdefault(proc_id, dict())
+        elif e.tag == 'CHANNEL':
+            filename = e.attrib['filename']
+            # it so happens that if the actual processor is, e.g., "100", the processor id
+            # is misspecified as, e.g., "102" under Record Node 102
+            real_proc_id = filename.split('_')[0]
+            chname = e.attrib['name']
+            channel_lookup[rec_num][proc_id][filename] = chname
+        if (proc_id and real_proc_id) and (proc_id != real_proc_id):
+            chan_table = channel_lookup[rec_num].pop(proc_id)
+            proc_id = real_proc_id
+            channel_lookup[rec_num][proc_id] = chan_table
+    return channel_lookup
+
+
+# internal institutional cleanups
+def normalize_channels(channel_lookup: dict):
+    chans_per_bank = 32
+    for rec_num, rec_tree in channel_lookup.items():
+        for proc_id, chan_tree in rec_tree.items():
+            ch_values = list(chan_tree.values())
+            ch_keys = list(chan_tree.keys())
+            # This is the problem of channel streams going from CH97-CH128 and then rolling over.
+            # Fix: go by the file name instead
+            if len(set(ch_values)) < len(ch_values):
+                for k, v in zip(ch_keys, ch_values):
+                    if v.startswith('CH'):
+                        real_chan_id = k.replace('.continuous', '').split('_')[1]
+                        chan_tree[k] = 'CH{}'.format(real_chan_id)
+                continue
+            encoding_parts = [len(v.split('_')) for v in ch_values]
+            # This is the scenario when channel streams are encoded by ABC banks as A1_CH1, ..., B1_CH1, ...
+            if max(encoding_parts) > 1:
+                for n in range(len(encoding_parts)):
+                    if encoding_parts[n] > 1:
+                        bank_id, bank_chan = ch_values[n].split('_')
+                        chan_str = re.split(r'(\d+)', bank_chan)[0]
+                        # note that chan_id is not unique in case of CH + AUX
+                        bank_chan = int(bank_chan.replace(chan_str, ''))
+                        offset = chans_per_bank * 'ABC'.index(bank_id[0])
+                        chan_tree[ch_keys[n]] = 'CH{}'.format(offset + bank_chan)
+    return channel_lookup
+
+
+
+
+
+
+
+
+
+
+
+
