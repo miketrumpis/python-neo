@@ -69,9 +69,12 @@ class OpenEphysRawIO(BaseRawIO):
     extensions = ['continuous', 'openephys', 'spikes', 'events', 'xml']
     rawmode = 'one-dir'
 
-    def __init__(self, dirname=''):
+    def __init__(self, dirname='', allow_time_faults_before: float=None):
         BaseRawIO.__init__(self)
         self.dirname = dirname
+        if allow_time_faults_before is None:
+            allow_time_faults_before = float(os.environ.get('PYNEO_TIME_FAULT_TOL', 0.0))
+        self._time_fault_tol = allow_time_faults_before
 
     def _source_name(self):
         return self.dirname
@@ -79,7 +82,9 @@ class OpenEphysRawIO(BaseRawIO):
     def _parse_header(self):
         info = self._info = explore_folder(self.dirname)
         nb_segment = info['nb_segment']
-        channel_lookup = parse_channel_structure(self.dirname, nb_segment)
+        # channel_lookup = parse_channel_structure(self.dirname, nb_segment)
+        # ONLY look for the first segment, ignore all others
+        channel_lookup = parse_channel_structure(self.dirname, 1)
         channel_lookup = normalize_channels(channel_lookup)
 
         # scan for continuous files
@@ -87,7 +92,8 @@ class OpenEphysRawIO(BaseRawIO):
         self._sig_length = {}
         self._sig_timestamp0 = {}
         signal_channels = []
-        oe_indices = sorted(list(info['continuous'].keys()))
+        # oe_indices = sorted(list(info['continuous'].keys()))
+        oe_indices = list(channel_lookup.keys())
         for seg_index, oe_index in enumerate(oe_indices):
             self._sigs_memmap[seg_index] = {}
             seg_lookup = channel_lookup[oe_index]
@@ -119,9 +125,18 @@ class OpenEphysRawIO(BaseRawIO):
 
                 # check for continuity (no gaps)
                 diff = np.diff(data_chan['timestamp'])
-                assert np.all(diff == RECORD_SIZE), \
-                    'Not continuous timestamps for {}. ' \
-                    'Maybe because recording was paused/stopped.'.format(continuous_filename)
+                if not np.all(diff == RECORD_SIZE):
+                    faults = np.where(diff > RECORD_SIZE)[0]
+                    all_fault_times = data_chan['timestamp'][faults + 1] / chan_info['sampleRate']
+                    last_time = data_chan['timestamp'][-1] / chan_info['sampleRate']
+                    interior_time = np.array([min(t, last_time - t) for t in all_fault_times])
+                    # only hit the assertion error if fault was after tolerated grace period
+                    # last_fault = data_chan['timestamp'][faults.max() + 2]
+                    # if last_fault / chan_info['sampleRate'] > self._time_fault_tol:
+                    if any(interior_time) > self._time_fault_tol:
+                        assert np.all(diff == RECORD_SIZE), \
+                            'Not continuous timestamps for {}. ' \
+                            'Maybe because recording was paused/stopped.'.format(continuous_filename)
 
                 if seg_index == 0:
                     # add in channel list
@@ -481,8 +496,10 @@ def explore_folder(dirname):
             s = filename.replace('.continuous', '').split('_')
             if len(s) == 2:
                 seg_index = 0
+            elif any([stream_type in s[-1] for stream_type in ('AUX', 'ADC', 'CH')]):
+                seg_index = 0
             else:
-                seg_index = int(s[2]) - 1
+                seg_index = int(s[-1]) - 1
             if seg_index not in info['continuous'].keys():
                 info['continuous'][seg_index] = []
             info['continuous'][seg_index].append(filename)
