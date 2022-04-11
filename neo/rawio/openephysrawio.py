@@ -13,6 +13,7 @@ import re
 
 import numpy as np
 from lxml import etree
+from collections import OrderedDict
 
 from .baserawio import (BaseRawIO, _signal_channel_dtype, _signal_stream_dtype,
                 _spike_channel_dtype, _event_channel_dtype)
@@ -86,6 +87,7 @@ class OpenEphysRawIO(BaseRawIO):
         # ONLY look for the first segment, ignore all others
         channel_lookup = parse_channel_structure(self.dirname, 1)
         channel_lookup = normalize_channels(channel_lookup)
+        # info['continuous'][0] = list(channel_lookup.keys())
 
         # scan for continuous files
         self._sigs_memmap = {}
@@ -94,58 +96,59 @@ class OpenEphysRawIO(BaseRawIO):
         signal_channels = []
         # oe_indices = sorted(list(info['continuous'].keys()))
         oe_indices = list(channel_lookup.keys())
+
         for seg_index, oe_index in enumerate(oe_indices):
             self._sigs_memmap[seg_index] = {}
-            seg_lookup = channel_lookup[oe_index]
+            # seg_lookup = channel_lookup[oe_index]
             all_sigs_length = []
             all_first_timestamps = []
             all_last_timestamps = []
             all_samplerate = []
-            for chan_index, continuous_filename in enumerate(info['continuous'][oe_index]):
-                fullname = os.path.join(self.dirname, continuous_filename)
-                chan_info = read_file_header(fullname)
+            seg_lookup = channel_lookup[oe_index]
+            for processor_id in seg_lookup.keys():
+                processor_channels = seg_lookup[processor_id]
+                for chan_index, continuous_filename in enumerate(processor_channels.keys()):
+                    fullname = os.path.join(self.dirname, continuous_filename)
+                    chan_info = read_file_header(fullname)
+                    ch_name = processor_channels[continuous_filename]
+                    chan_str = re.split(r'(\d+)', ch_name)[0]
+                    # note that chan_id is not unique in case of CH + AUX
+                    chan_id = int(ch_name.replace(chan_str, ''))
 
-                s = continuous_filename.replace('.continuous', '').split('_')
-                processor_id = s[0]
-                ch_name = seg_lookup[processor_id][continuous_filename]
-                chan_str = re.split(r'(\d+)', ch_name)[0]
-                # note that chan_id is not unique in case of CH + AUX
-                chan_id = int(ch_name.replace(chan_str, ''))
+                    filesize = os.stat(fullname).st_size
+                    size = (filesize - HEADER_SIZE) // np.dtype(continuous_dtype).itemsize
+                    data_chan = np.memmap(fullname, mode='r', offset=HEADER_SIZE,
+                                          dtype=continuous_dtype, shape=(size, ))
+                    self._sigs_memmap[seg_index][chan_index] = data_chan
 
-                filesize = os.stat(fullname).st_size
-                size = (filesize - HEADER_SIZE) // np.dtype(continuous_dtype).itemsize
-                data_chan = np.memmap(fullname, mode='r', offset=HEADER_SIZE,
-                                      dtype=continuous_dtype, shape=(size, ))
-                self._sigs_memmap[seg_index][chan_index] = data_chan
+                    all_sigs_length.append(data_chan.size * RECORD_SIZE)
+                    all_first_timestamps.append(data_chan[0]['timestamp'])
+                    all_last_timestamps.append(data_chan[-1]['timestamp'])
+                    all_samplerate.append(chan_info['sampleRate'])
 
-                all_sigs_length.append(data_chan.size * RECORD_SIZE)
-                all_first_timestamps.append(data_chan[0]['timestamp'])
-                all_last_timestamps.append(data_chan[-1]['timestamp'])
-                all_samplerate.append(chan_info['sampleRate'])
+                    # check for continuity (no gaps)
+                    diff = np.diff(data_chan['timestamp'])
+                    if not np.all(diff == RECORD_SIZE):
+                        faults = np.where(diff > RECORD_SIZE)[0]
+                        all_fault_times = data_chan['timestamp'][faults + 1] / chan_info['sampleRate']
+                        last_time = data_chan['timestamp'][-1] / chan_info['sampleRate']
+                        interior_time = np.array([min(t, last_time - t) for t in all_fault_times])
+                        # only hit the assertion error if fault was after tolerated grace period
+                        # last_fault = data_chan['timestamp'][faults.max() + 2]
+                        # if last_fault / chan_info['sampleRate'] > self._time_fault_tol:
+                        if any(interior_time) > self._time_fault_tol:
+                            assert np.all(diff == RECORD_SIZE), \
+                                'Not continuous timestamps for {}. ' \
+                                'Maybe because recording was paused/stopped.'.format(continuous_filename)
 
-                # check for continuity (no gaps)
-                diff = np.diff(data_chan['timestamp'])
-                if not np.all(diff == RECORD_SIZE):
-                    faults = np.where(diff > RECORD_SIZE)[0]
-                    all_fault_times = data_chan['timestamp'][faults + 1] / chan_info['sampleRate']
-                    last_time = data_chan['timestamp'][-1] / chan_info['sampleRate']
-                    interior_time = np.array([min(t, last_time - t) for t in all_fault_times])
-                    # only hit the assertion error if fault was after tolerated grace period
-                    # last_fault = data_chan['timestamp'][faults.max() + 2]
-                    # if last_fault / chan_info['sampleRate'] > self._time_fault_tol:
-                    if any(interior_time) > self._time_fault_tol:
-                        assert np.all(diff == RECORD_SIZE), \
-                            'Not continuous timestamps for {}. ' \
-                            'Maybe because recording was paused/stopped.'.format(continuous_filename)
-
-                if seg_index == 0:
-                    # add in channel list
-                    if ch_name[:2].upper() == 'CH':
-                        units = 'uV'
-                    else:
-                        units = 'V'
-                    signal_channels.append((ch_name, chan_id, chan_info['sampleRate'],
-                                'int16', units, chan_info['bitVolts'], 0., processor_id))
+                    if seg_index == 0:
+                        # add in channel list
+                        if ch_name[:2].upper() == 'CH':
+                            gain = chan_info['bitVolts'] * 1e-6
+                        else:
+                            gain = chan_info['bitVolts']
+                        signal_channels.append((ch_name, chan_id, chan_info['sampleRate'],
+                                    'int16', 'V', gain, 0., processor_id))
 
             # In some cases, continuous do not have the same length because
             # one record block is missing when the "OE GUI is freezing"
@@ -186,6 +189,100 @@ class OpenEphysRawIO(BaseRawIO):
 
             self._sig_length[seg_index] = all_sigs_length[0]
             self._sig_timestamp0[seg_index] = all_first_timestamps[0]
+
+        #
+        # for seg_index, oe_index in enumerate(oe_indices):
+        #     self._sigs_memmap[seg_index] = {}
+        #     seg_lookup = channel_lookup[oe_index]
+        #     all_sigs_length = []
+        #     all_first_timestamps = []
+        #     all_last_timestamps = []
+        #     all_samplerate = []
+        #     for chan_index, continuous_filename in enumerate(info['continuous'][oe_index]):
+        #         fullname = os.path.join(self.dirname, continuous_filename)
+        #         chan_info = read_file_header(fullname)
+        #
+        #         s = continuous_filename.replace('.continuous', '').split('_')
+        #         processor_id = s[0]
+        #         ch_name = seg_lookup[processor_id][continuous_filename]
+        #         chan_str = re.split(r'(\d+)', ch_name)[0]
+        #         # note that chan_id is not unique in case of CH + AUX
+        #         chan_id = int(ch_name.replace(chan_str, ''))
+        #
+        #         filesize = os.stat(fullname).st_size
+        #         size = (filesize - HEADER_SIZE) // np.dtype(continuous_dtype).itemsize
+        #         data_chan = np.memmap(fullname, mode='r', offset=HEADER_SIZE,
+        #                               dtype=continuous_dtype, shape=(size, ))
+        #         self._sigs_memmap[seg_index][chan_index] = data_chan
+        #
+        #         all_sigs_length.append(data_chan.size * RECORD_SIZE)
+        #         all_first_timestamps.append(data_chan[0]['timestamp'])
+        #         all_last_timestamps.append(data_chan[-1]['timestamp'])
+        #         all_samplerate.append(chan_info['sampleRate'])
+        #
+        #         # check for continuity (no gaps)
+        #         diff = np.diff(data_chan['timestamp'])
+        #         if not np.all(diff == RECORD_SIZE):
+        #             faults = np.where(diff > RECORD_SIZE)[0]
+        #             all_fault_times = data_chan['timestamp'][faults + 1] / chan_info['sampleRate']
+        #             last_time = data_chan['timestamp'][-1] / chan_info['sampleRate']
+        #             interior_time = np.array([min(t, last_time - t) for t in all_fault_times])
+        #             # only hit the assertion error if fault was after tolerated grace period
+        #             # last_fault = data_chan['timestamp'][faults.max() + 2]
+        #             # if last_fault / chan_info['sampleRate'] > self._time_fault_tol:
+        #             if any(interior_time) > self._time_fault_tol:
+        #                 assert np.all(diff == RECORD_SIZE), \
+        #                     'Not continuous timestamps for {}. ' \
+        #                     'Maybe because recording was paused/stopped.'.format(continuous_filename)
+        #
+        #         if seg_index == 0:
+        #             # add in channel list
+        #             if ch_name[:2].upper() == 'CH':
+        #                 gain = chan_info['bitVolts'] * 1e-6
+        #             else:
+        #                 gain = chan_info['bitVolts']
+        #             signal_channels.append((ch_name, chan_id, chan_info['sampleRate'],
+        #                         'int16', 'V', gain, 0., processor_id))
+        #
+        #     # In some cases, continuous do not have the same lentgh because
+        #     # one record block is missing when the "OE GUI is freezing"
+        #     # So we need to clip to the smallest files
+        #     if not all(all_sigs_length[0] == e for e in all_sigs_length) or\
+        #             not all(all_first_timestamps[0] == e for e in all_first_timestamps):
+        #
+        #         self.logger.warning('Continuous files do not have aligned timestamps; '
+        #                             'clipping to make them aligned.')
+        #
+        #         first, last = -np.inf, np.inf
+        #         for chan_index in self._sigs_memmap[seg_index]:
+        #             data_chan = self._sigs_memmap[seg_index][chan_index]
+        #             if data_chan[0]['timestamp'] > first:
+        #                 first = data_chan[0]['timestamp']
+        #             if data_chan[-1]['timestamp'] < last:
+        #                 last = data_chan[-1]['timestamp']
+        #
+        #         all_sigs_length = []
+        #         all_first_timestamps = []
+        #         all_last_timestamps = []
+        #         for chan_index in self._sigs_memmap[seg_index]:
+        #             data_chan = self._sigs_memmap[seg_index][chan_index]
+        #             keep = (data_chan['timestamp'] >= first) & (data_chan['timestamp'] <= last)
+        #             data_chan = data_chan[keep]
+        #             self._sigs_memmap[seg_index][chan_index] = data_chan
+        #             all_sigs_length.append(data_chan.size * RECORD_SIZE)
+        #             all_first_timestamps.append(data_chan[0]['timestamp'])
+        #             all_last_timestamps.append(data_chan[-1]['timestamp'])
+        #
+        #     # check that all signals have the same lentgh and timestamp0 for this segment
+        #     assert all(all_sigs_length[0] == e for e in all_sigs_length),\
+        #                'Not all signals have the same length'
+        #     assert all(all_first_timestamps[0] == e for e in all_first_timestamps),\
+        #                'Not all signals have the same first timestamp'
+        #     assert all(all_samplerate[0] == e for e in all_samplerate),\
+        #                'Not all signals have the same sample rate'
+        #
+        #     self._sig_length[seg_index] = all_sigs_length[0]
+        #     self._sig_timestamp0[seg_index] = all_first_timestamps[0]
 
         signal_channels = np.array(signal_channels, dtype=_signal_channel_dtype)
         self._sig_sampling_rate = signal_channels['sampling_rate'][0]  # unique for channel
@@ -607,7 +704,7 @@ def parse_channel_structure(dirname, segment):
     except Exception as e:
         # could catch exception, but let it raise for now to propagate
         raise e
-    channel_lookup = dict()
+    channel_lookup = OrderedDict()
     rec_num = None
     proc_id = None
     real_proc_id = None
