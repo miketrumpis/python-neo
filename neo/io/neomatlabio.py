@@ -13,13 +13,28 @@ Author: sgarcia, Robert Pröpper
 """
 
 from datetime import datetime
+from packaging.version import parse
 import re
 
 import numpy as np
 import quantities as pq
 
-from packaging.version import Version
-
+# check scipy
+try:
+    import scipy.io
+    import scipy.version
+except ImportError as err:
+    HAVE_SCIPY = False
+    SCIPY_ERR = err
+else:
+    if parse(scipy.version.version) < parse('0.12.0'):
+        HAVE_SCIPY = False
+        SCIPY_ERR = ImportError("your scipy version is too old to support "
+                                + "MatlabIO, you need at least 0.12.0. "
+                                + "You have %s" % scipy.version.version)
+    else:
+        HAVE_SCIPY = True
+        SCIPY_ERR = None
 
 from neo.io.baseio import BaseIO
 from neo.core import (Block, Segment, AnalogSignal, IrregularlySampledSignal,

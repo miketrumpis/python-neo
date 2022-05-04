@@ -1,5 +1,5 @@
 import datetime
-from packaging.version import Version
+from packaging.version import parse
 import os
 import re
 from collections import OrderedDict
@@ -189,9 +189,7 @@ class NlxHeader(OrderedDict):
             self['ApplicationName'] = 'Neuraview'
             app_version = '2'
 
-        if " Development" in app_version:
-            app_version = app_version.replace(" Development", ".dev0")
-        self['ApplicationVersion'] = Version(app_version)
+        self['ApplicationVersion'] = parse(app_version)
 
         # convert bit_to_microvolt
         if 'bit_to_microVolt' in self:
@@ -217,22 +215,22 @@ class NlxHeader(OrderedDict):
         an = self['ApplicationName']
         if an == 'Cheetah':
             av = self['ApplicationVersion']
-            if av <= Version('2'):  # version 1 uses same as older versions
+            if av <= parse('2'):  # version 1 uses same as older versions
                 hpd = NlxHeader.header_pattern_dicts['bv5.6.4']
-            elif av < Version('5'):
+            elif av < parse('5'):
                 hpd = NlxHeader.header_pattern_dicts['bv5']
-            elif av <= Version('5.4.0'):
+            elif av <= parse('5.4.0'):
                 hpd = NlxHeader.header_pattern_dicts['v5.4.0']
-            elif av <= Version('5.6.4'):
+            elif av <= parse('5.6.4'):
                 hpd = NlxHeader.header_pattern_dicts['bv5.6.4']
             else:
                 hpd = NlxHeader.header_pattern_dicts['def']
         elif an == 'BML':
             hpd = NlxHeader.header_pattern_dicts['bml']
-            av = Version("2")
+            av = parse("2")
         elif an == 'Neuraview':
             hpd = NlxHeader.header_pattern_dicts['neuraview2']
-            av = Version("2")
+            av = parse("2")
         else:
             an = "Unknown"
             av = "NA"
