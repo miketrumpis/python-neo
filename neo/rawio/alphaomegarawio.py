@@ -1,4 +1,4 @@
-"""
+r"""
 This module implements file reader for AlphaOmega MPX file format version 4.
 
 This module expect default channel names from the AlphaOmega record system (RAW
